@@ -1,18 +1,24 @@
 #!/bin/bash
 # terminal-project-folders — installer
-# Adds `proj` and `newproj` to your zsh shell, plus a small Claude Code status line.
+# Adds `proj` and `newproj` to your zsh shell, a `claude` wrapper that supports
+# plain-English project hopping, a tiny Claude Code status line, and a global
+# CLAUDE.md fragment that teaches Claude the plain-English conventions.
 # Idempotent: re-running cleanly replaces any previous install.
 
 set -eu
 
 ZSHRC="$HOME/.zshrc"
 CLAUDE_DIR="$HOME/.claude"
+CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
 STATUSLINE="$CLAUDE_DIR/statusline.sh"
 SETTINGS="$CLAUDE_DIR/settings.json"
 PROJECTS_DIR="$HOME/projects"
+HOP_DIR="$HOME/.terminal-project-folders"
 
 MARKER_BEGIN="# ---- TERMINAL_PROJECT_FOLDERS_BEGIN ----"
 MARKER_END="# ---- TERMINAL_PROJECT_FOLDERS_END ----"
+CLAUDE_MD_BEGIN="<!-- TERMINAL_PROJECT_FOLDERS_BEGIN -->"
+CLAUDE_MD_END="<!-- TERMINAL_PROJECT_FOLDERS_END -->"
 
 GREEN='\033[32m'
 YELLOW='\033[33m'
@@ -31,9 +37,9 @@ echo ""
 # Preflight
 [ "$(uname)" = "Darwin" ] || warn "Not macOS (detected $(uname)); install may work but is unsupported."
 command -v jq >/dev/null 2>&1 || fatal "jq not found. Install with: brew install jq"
-command -v claude >/dev/null 2>&1 || warn "claude CLI not found. Install from https://claude.com/claude-code if you want \`proj <name>\` to resume sessions."
+command -v claude >/dev/null 2>&1 || warn "claude CLI not found. Install from https://claude.com/claude-code for full functionality."
 
-mkdir -p "$PROJECTS_DIR" "$CLAUDE_DIR"
+mkdir -p "$PROJECTS_DIR" "$CLAUDE_DIR" "$HOP_DIR"
 
 # 1. Write the Claude Code status line script
 cat > "$STATUSLINE" <<'STATUSLINE_EOF'
@@ -82,9 +88,77 @@ fi
 cat >> "$ZSHRC" <<'ZSHRC_EOF'
 
 # ---- TERMINAL_PROJECT_FOLDERS_BEGIN ----
-# proj — list projects, or jump into one and resume the last Claude Code session.
+# claude wrapper — enables "open <project>" hops from inside a Claude session.
+# A session can write a project name to ~/.terminal-project-folders/hop, then
+# the user /exits, and this wrapper cd's into that project and starts a fresh
+# Claude session whose working agreement is the project's own CLAUDE.md.
+# Use `command claude ...` to bypass the wrapper.
+claude() {
+  local HOP_FILE="$HOME/.terminal-project-folders/hop"
+  local PROJECTS_DIR="$HOME/projects"
+  mkdir -p "$(dirname "$HOP_FILE")"
+  local first=1
+  while :; do
+    rm -f "$HOP_FILE"
+    if [ $first -eq 1 ]; then
+      command claude "$@"
+      first=0
+    else
+      command claude -c
+    fi
+    [ -s "$HOP_FILE" ] || break
+    local target
+    target=$(cat "$HOP_FILE")
+    rm -f "$HOP_FILE"
+    [ -z "$target" ] && break
+    if [ ! -d "$PROJECTS_DIR/$target" ]; then
+      echo "Hop requested for unknown project: $target" >&2
+      break
+    fi
+    cd "$PROJECTS_DIR/$target" || break
+    echo
+    echo "→ opening $target"
+    echo
+  done
+}
+
+# proj — list projects, jump into one, or show help.
 proj() {
   local PROJECTS_DIR="$HOME/projects"
+
+  if [ "$1" = "help" ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
+    local who
+    who=$(git config --global user.name 2>/dev/null | awk '{print $1}')
+    [ -z "$who" ] && command -v gh >/dev/null 2>&1 && who=$(gh api user --jq .login 2>/dev/null)
+    [ -z "$who" ] && who="$USER"
+
+    cat <<'HELP_TOP'
+
+ _____                   _             _    __       _     _
+|_   _|__ _ __ _ __ ___ (_)_ __   __ _| |  / _| ___ | | __| | ___ _ __ ___
+  | |/ _ \ '__| '_ ` _ \| | '_ \ / _` | | | |_ / _ \| |/ _` |/ _ \ '__/ __|
+  | |  __/ |  | | | | | | | | | | (_| | | |  _| (_) | | (_| |  __/ |  \__ \
+  |_|\___|_|  |_| |_| |_|_|_| |_|\__,_|_| |_|  \___/|_|\__,_|\___|_|  |___/
+
+HELP_TOP
+    printf "  Hi %s. This tool keeps your design and coding projects in one place.\n\n" "$who"
+    cat <<'HELP_BODY'
+  Each project you create:
+
+  • lives in its own folder under ~/projects/
+  • gets its own port, so nothing clashes
+  • remembers your last Claude Code session
+
+  Start Claude and ask in plain English:
+
+  • "list my projects"
+  • "create new project"
+  • "open project X"
+
+HELP_BODY
+    return 0
+  fi
+
   if [ $# -eq 0 ]; then
     printf "\n  %-30s  %-5s  %s\n" "PROJECT" "PORT" "LAST MODIFIED"
     printf "  %-30s  %-5s  %s\n" "------------------------------" "-----" "--------------"
@@ -204,12 +278,72 @@ EOF
 ZSHRC_EOF
 ok "Shell helpers added to $ZSHRC"
 
+# 4. Patch ~/.claude/CLAUDE.md — replace any previous block
+[ -f "$CLAUDE_MD" ] || touch "$CLAUDE_MD"
+if grep -q "$CLAUDE_MD_BEGIN" "$CLAUDE_MD"; then
+  tmp=$(mktemp)
+  awk -v b="$CLAUDE_MD_BEGIN" -v e="$CLAUDE_MD_END" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip
+  ' "$CLAUDE_MD" > "$tmp" && mv "$tmp" "$CLAUDE_MD"
+fi
+
+cat >> "$CLAUDE_MD" <<'CLAUDE_MD_EOF'
+<!-- TERMINAL_PROJECT_FOLDERS_BEGIN -->
+# Projects layout — terminal-project-folders
+
+The user keeps their design and coding projects under `~/projects/<name>/`. Each project has its own folder, its own reserved localhost port (in `<name>/.env` as `PORT=`), and its own `CLAUDE.md` working agreement.
+
+When the user refers to a project by name ("look at the `foo` project", "what's in `bar`'s README"), resolve it to `~/projects/<name>/` and use Read, Grep, Glob, and Bash against full paths. **Do not refuse on the grounds that your current working directory is elsewhere** — full-path reads and edits are the point of this layout.
+
+## Plain-English project commands
+
+From inside a Claude session, handle these directly. The shell helpers (`proj`, `newproj`) are only for use *outside* a Claude conversation.
+
+- **"list projects" / "show my projects"** → list `~/projects/*/` with port (from each `.env`) and last-modified date.
+- **"create project X" / "new project X"** → scaffold `~/projects/X/` with a free port, `.env` (`PORT=<port>`), `.gitignore`, `CLAUDE.md`, `README.md`. Mirror the format used by `newproj` in `~/.zshrc`. The project name must be lowercase alphanumeric with hyphens. Pick the first free port starting from 3001 (check existing `.env` `PORT=` lines plus `lsof -iTCP:<port> -sTCP:LISTEN`).
+- **"open project X" / "switch to X" / "go to X"** → write the project name to `~/.terminal-project-folders/hop` (create the parent directory if needed) and tell the user to press Ctrl+D or `/exit`. Their `claude` shell wrapper will then cd into project X and start a fresh Claude session whose working agreement is X's own `CLAUDE.md`.
+
+The hop file is the only way to "open" a project from inside an existing Claude session — a subprocess cannot change its parent shell's cwd or restart the parent's Claude session, so we leave a note the wrapper picks up on exit.
+
+## Shell entry points (for the user, not for Claude)
+
+- `proj` — list all projects.
+- `proj <name>` — cd into a project and resume its last Claude session.
+- `newproj <name>` — scaffold a new project on a free port.
+
+Source: https://github.com/jasontheodorou/terminal-project-folders
+<!-- TERMINAL_PROJECT_FOLDERS_END -->
+CLAUDE_MD_EOF
+ok "Plain-English conventions added to $CLAUDE_MD"
+
+# 5. Final banner with personalised greeting
+WHO=$(git config --global user.name 2>/dev/null | awk '{print $1}')
+[ -z "$WHO" ] && command -v gh >/dev/null 2>&1 && WHO=$(gh api user --jq .login 2>/dev/null)
+[ -z "$WHO" ] && WHO="$USER"
+
 echo ""
-printf "${GREEN}${BOLD}Installed.${RESET}\n"
-echo ""
-echo "Open a new terminal, then:"
-echo ""
-echo "  newproj my-thing       # create a project on a free port"
-echo "  proj                   # list your projects"
-echo "  proj my-thing          # jump in and resume the last Claude Code session"
-echo ""
+cat <<'BANNER'
+ _____                   _             _    __       _     _
+|_   _|__ _ __ _ __ ___ (_)_ __   __ _| |  / _| ___ | | __| | ___ _ __ ___
+  | |/ _ \ '__| '_ ` _ \| | '_ \ / _` | | | |_ / _ \| |/ _` |/ _ \ '__/ __|
+  | |  __/ |  | | | | | | | | | | (_| | | |  _| (_) | | (_| |  __/ |  \__ \
+  |_|\___|_|  |_| |_| |_|_|_| |_|\__,_|_| |_|  \___/|_|\__,_|\___|_|  |___/
+
+BANNER
+printf "  Hi %s. This tool keeps your design and coding projects in one place.\n\n" "$WHO"
+cat <<'BODY'
+  Each project you create:
+
+  • lives in its own folder under ~/projects/
+  • gets its own port, so nothing clashes
+  • remembers your last Claude Code session
+
+  Start Claude and ask in plain English:
+
+  • "list my projects"
+  • "create new project"
+  • "open project X"
+
+BODY
